@@ -1367,7 +1367,7 @@
   .winner-entry .name{ animation:winPop 1s cubic-bezier(.22,1,.36,1) calc(var(--i,0) * .14s) backwards; }
   @keyframes winPop{ from{ opacity:0; transform:scale(.65); filter:blur(14px); letter-spacing:.14em; } 60%{ filter:blur(0); } }
   .rw-reroll-window.landed{ animation:none; box-shadow:none; }
-  .obs-link-wrap{ display:flex; justify-content:center; margin-top:26px; }
+  .obs-link-wrap{ display:flex; justify-content:center; flex-wrap:wrap; gap:10px; margin-top:26px; }
   .obs-btn{
     display:inline-flex; align-items:center; justify-content:center;
     font-family:var(--display); font-weight:600; font-size:14px; text-decoration:none;
@@ -1415,7 +1415,7 @@
     </button>
 
     <div class="splash-hint">Примечание: <code>nickname</code> может отличаться в ссылке.</div>
-    <div class="obs-link-wrap"><a class="obs-btn" href="https://obs-bots.github.io/ChatOBS/" target="_blank" rel="noopener">чат для OBS</a></div>
+    <div class="obs-link-wrap"><a class="obs-btn" href="https://obs-bots.github.io/ChatOBS/" target="_blank" rel="noopener">чат для OBS</a><a class="obs-btn" href="https://obs-bots.github.io/bet/" target="_blank" rel="noopener">Ставки OBS</a></div>
   </div>
 </div>
 
