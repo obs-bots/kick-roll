@@ -63,7 +63,6 @@
   body{
     background:
       radial-gradient(ellipse 900px 500px at 50% -10%, rgba(138,180,255,0.10), transparent 60%),
-      radial-gradient(ellipse 700px 400px at 85% 10%, rgba(var(--accent-rgb),0.06), transparent 60%),
       var(--bg-0);
     color:var(--text);
     font-family:var(--display);
@@ -573,6 +572,14 @@
     font-size:10.5px;
     color:var(--muted);
     margin-top:5px;
+  }
+  .history-entry.replaced{ opacity:.6; }
+  .history-entry.replaced .h-name{ color:var(--muted); text-decoration:line-through; }
+  .h-note{
+    font-family:var(--mono);
+    font-size:10.5px;
+    color:var(--danger);
+    margin-top:3px;
   }
   .history-hint{
     font-size:11px;
@@ -1426,7 +1433,7 @@
   <div class="topbar">
     <div class="brand"><span class="mark" id="brandMark">KICK</span> розыгрыш по слову в чате by <span class="author">coffee_mayzz</span> & <span class="author"> ugewaru</span></div>
 
-    <div class="status-pill"><span class="dot" id="statusDot"></span><span id="statusText">не подключено</span></div>
+    <div class="status-pill" role="status" aria-live="polite" aria-atomic="true"><span class="dot" id="statusDot"></span><span id="statusText">не подключено</span></div>
   </div>
 
   <div class="hero">
@@ -1546,15 +1553,25 @@
      rafWhenVisible(fn) планирует следующий кадр как обычно, пока вкладка видна,
      а если вкладка скрыта — откладывает запуск до события visibilitychange,
      вместо того чтобы продолжать рисовать кадры впустую. */
+  // Пока вкладка скрыта, все отложенные кадры копятся в одном Set и
+  // запускаются одним-единственным слушателем visibilitychange (раньше на
+  // каждый вызов вешался свой слушатель). Set заодно не даёт запустить
+  // один и тот же цикл анимации дважды.
+  let rafResumeQueue = null;
   function rafWhenVisible(fn){
     if (document.hidden){
-      const resume = () => {
-        if (!document.hidden){
+      if (!rafResumeQueue){
+        rafResumeQueue = new Set();
+        const resume = () => {
+          if (document.hidden) return;
           document.removeEventListener('visibilitychange', resume);
-          requestAnimationFrame(fn);
-        }
-      };
-      document.addEventListener('visibilitychange', resume);
+          const queued = rafResumeQueue;
+          rafResumeQueue = null;
+          queued.forEach((f) => requestAnimationFrame(f));
+        };
+        document.addEventListener('visibilitychange', resume);
+      }
+      rafResumeQueue.add(fn);
       return;
     }
     requestAnimationFrame(fn);
@@ -1562,6 +1579,16 @@
 (function(){
   const PUSHER_URL = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.4.0&flash=false';
   const TWITCH_IRC_URL = 'wss://irc-ws.chat.twitch.tv:443';
+  // Kick API не отдаёт CORS-заголовки для чужих сайтов, поэтому с GitHub Pages
+  // прямой запрос часто падает — тогда пробуем публичные CORS-прокси.
+  const KICK_API_BASE = 'https://kick.com/api/v2/channels/';
+  const KICK_API_PROXIES = [
+    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+  ];
+  const LOOKUP_DIRECT_TIMEOUT_MS = 6000;
+  const LOOKUP_PROXY_TIMEOUT_MS = 8000;
 
   let CHANNEL_SLUG = null; // задаётся на вступительном экране пользователем
   let PLATFORM = 'kick';   // 'kick' | 'twitch' — тоже задаётся на вступительном экране
@@ -1753,11 +1780,12 @@
      руками. Для живого розыгрыша это значит, что часть зрителей могла
      не попасть в розыгрыш незамеченно. Теперь при любом неожиданном закрытии
      сокета виджет сам пробует переподключиться с растущей паузой между
-     попытками (экспоненциальный backoff, до 20 секунд), пока не получится.
+     попытками (экспоненциальный backoff, до 20 секунд), а после первых
+     восьми попыток — без лимита, раз в 90 секунд, пока не получится.
 
      connectionGen — счётчик "поколений" соединения: при каждом новом вызове
      connectKickWebSocket/connectTwitchIRC (в том числе ручном клике
-     "Переподключиться") он увеличивается, и старое соединение запоминает
+     "Подключиться") он увеличивается, и старое соединение запоминает
      свой номер. Если к моменту срабатывания onclose/таймера номер уже не
      совпадает с текущим — значит соединение переоткрыли вручную, и повторно
      переподключаться по старому не нужно (иначе получили бы два параллельных
@@ -1765,29 +1793,79 @@
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let connectionGen = 0;
-  // После стольких неудачных попыток подряд перестаём долбиться в мёртвый
-  // канал (опечатка в нике, забаненный/приостановленный канал) и показываем
-  // понятную ошибку вместо бесконечного "переподключение..." — с растущей
-  // паузой между попытками это уже больше 10 минут ожидания к этому моменту.
-  const MAX_RECONNECT_ATTEMPTS = 8;
+  // Первые FAST_RECONNECT_ATTEMPTS попыток идут с растущей паузой (до 20 с),
+  // дальше — редкие, но бесконечные повторы раз в SLOW_RECONNECT_SEC. В OBS
+  // browser source перезагрузка страницы — ручное действие стримера, поэтому
+  // виджет не сдаётся: как только сеть или канал вернутся, он подключится сам.
+  const FAST_RECONNECT_ATTEMPTS = 8;
+  const SLOW_RECONNECT_SEC = 90;
+  let pendingReconnect = null; // функция немедленного повтора — нужна событию 'online'
 
   function clearReconnect(){
     if (reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
+    pendingReconnect = null;
   }
 
   function scheduleReconnect(fn, myGen){
     clearReconnect();
     reconnectAttempts++;
-    if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS){
-      setStatus('err', 'не удалось переподключиться к чату', 'проверьте никнейм/ID канала и перезагрузите страницу, чтобы попробовать снова');
-      return;
+    const slow = reconnectAttempts > FAST_RECONNECT_ATTEMPTS;
+    const delaySec = slow ? SLOW_RECONNECT_SEC : Math.min(20, Math.round(Math.pow(1.7, reconnectAttempts)));
+    if (slow){
+      setStatus('err', 'нет связи с чатом, повтор через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' — проверьте интернет и ник/ID канала');
+    } else {
+      setStatus('connecting', 'связь оборвалась, переподключение через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' из ' + FAST_RECONNECT_ATTEMPTS);
     }
-    const delaySec = Math.min(20, Math.round(Math.pow(1.7, reconnectAttempts)));
-    setStatus('connecting', 'связь оборвалась, переподключение через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' из ' + MAX_RECONNECT_ATTEMPTS);
-    reconnectTimer = setTimeout(() => {
+    const run = () => {
+      reconnectTimer = null;
+      pendingReconnect = null;
       if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную
       fn();
-    }, delaySec * 1000);
+    };
+    pendingReconnect = run;
+    reconnectTimer = setTimeout(run, delaySec * 1000);
+  }
+
+  // Вернулась сеть — не ждём окончания паузы (особенно длинной, 90 с).
+  window.addEventListener('online', () => {
+    if (!pendingReconnect) return;
+    const run = pendingReconnect;
+    clearTimeout(reconnectTimer);
+    run();
+  });
+
+  /* ---------------- сторожевой таймер сокета ----------------
+     TCP-соединение может формально жить, а сервер — молчать (обрыв на
+     промежуточном узле, сон ноутбука). Тогда onclose не придёт, виджет будет
+     «в эфире» и тихо терять участников. Сторож считает время с последнего
+     входящего сообщения: после PROBE_AFTER пингует сервер (ответ на пинг
+     тоже считается активностью), а если тишина дошла до DEAD_AFTER —
+     принудительно закрывает сокет и запускает обычный реконнект. */
+  const WATCHDOG_TICK_MS = 10000;
+  const WATCHDOG_PROBE_AFTER_MS = 45000;
+  const WATCHDOG_DEAD_AFTER_MS = 100000;
+
+  function startWatchdog(socket, myGen, probe, onDead){
+    let lastRx = Date.now();
+    const timer = setInterval(() => {
+      if (myGen !== connectionGen || socket.readyState > WebSocket.OPEN){ clearInterval(timer); return; }
+      const idle = Date.now() - lastRx;
+      if (idle > WATCHDOG_DEAD_AFTER_MS){
+        clearInterval(timer);
+        // отвязываем обработчики, чтобы «зомби»-сокет не доставил ничего поздно
+        socket.onmessage = null; socket.onerror = null; socket.onclose = null;
+        try { socket.close(); } catch(e){}
+        onDead();
+        return;
+      }
+      if (idle > WATCHDOG_PROBE_AFTER_MS && socket.readyState === WebSocket.OPEN){
+        try { probe(); } catch(e){}
+      }
+    }, WATCHDOG_TICK_MS);
+    return {
+      touch(){ lastRx = Date.now(); },
+      stop(){ clearInterval(timer); },
+    };
   }
   let reactionPanel = null; // единая плавающая панель "слова победителя" с вкладками на всех победителей
   let drawing = false;
@@ -1842,6 +1920,14 @@
     renderHistory();
   }
 
+  // Победитель, заменённый через «не ответил(а)», остаётся в истории, но с
+  // пометкой — иначе рядом с новой записью непонятно, что с предыдущей.
+  function markHistoryReplaced(key){
+    const name = entrants.get(key) || key;
+    const entry = winnerHistory.find((e) => e.name === name && !e.replaced);
+    if (entry) entry.replaced = true;
+  }
+
   function renderHistory(){
     el.historyCount.textContent = '(' + winnerTotal + ')';
     el.historyList.innerHTML = '';
@@ -1854,7 +1940,7 @@
     }
     winnerHistory.forEach((entry) => {
       const row = document.createElement('div');
-      row.className = 'history-entry';
+      row.className = 'history-entry' + (entry.replaced ? ' replaced' : '');
 
       const name = document.createElement('div');
       name.className = 'h-name';
@@ -1872,6 +1958,13 @@
       time.className = 'h-time';
       time.textContent = entry.time;
       row.appendChild(time);
+
+      if (entry.replaced){
+        const note = document.createElement('div');
+        note.className = 'h-note';
+        note.textContent = 'не ответил(а) — заменён(а)';
+        row.appendChild(note);
+      }
 
       el.historyList.appendChild(row);
     });
@@ -1895,8 +1988,12 @@
 
   function setStatus(state, text, detail){
     el.statusDot.className = 'dot' + (state === 'live' ? ' live' : state === 'err' ? ' err' : '');
-    el.statusText.textContent = text;
-    el.statusDetail.textContent = detail || '';
+    // Пишем в DOM только при реальном изменении: сообщения чата вызывают
+    // setStatus('live', ...) с тем же текстом, и без этой проверки
+    // screen reader (aria-live) повторял бы статус на каждое сообщение.
+    if (el.statusText.textContent !== text) el.statusText.textContent = text;
+    const d = detail || '';
+    if (el.statusDetail.textContent !== d) el.statusDetail.textContent = d;
   }
 
   // Kick присылает эмодзи в тексте сообщения как токены вида [emote:12345:PogU] —
@@ -2377,12 +2474,46 @@
 
   /* ---------------- connection ---------------- */
 
+  // Один запрос с жёстким таймаутом. outerSignal позволяет отменить его
+  // снаружи, когда другой источник (прокси) уже ответил первым.
+  async function fetchChatroomId(url, timeoutMs, outerSignal){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const onOuterAbort = () => ctrl.abort();
+    if (outerSignal) outerSignal.addEventListener('abort', onOuterAbort);
+    try {
+      const res = await fetch(url, { headers: { 'Accept': 'application/json' }, signal: ctrl.signal });
+      if (!res.ok){
+        const err = new Error('http ' + res.status);
+        err.notFound = (res.status === 404);
+        throw err;
+      }
+      const json = await res.json();
+      const id = json && json.chatroom && json.chatroom.id;
+      if (!id) throw new Error('нет chatroom.id');
+      return id;
+    } finally {
+      clearTimeout(timer);
+      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
+    }
+  }
+
+  // Сначала напрямую (6 с). Если не вышло (CORS, сеть, таймаут) — все прокси
+  // параллельно, берём первый удачный ответ. Читаемый 404 от самого Kick —
+  // честный ответ «канала нет», прокси тут не нужны.
   async function lookupChatroomId(slug){
-    const res = await fetch('https://kick.com/api/v2/channels/' + encodeURIComponent(slug), { headers: { 'Accept': 'application/json' }});
-    if (!res.ok) throw new Error('http ' + res.status);
-    const json = await res.json();
-    if (!json || !json.chatroom || !json.chatroom.id) throw new Error('нет chatroom.id');
-    return json.chatroom.id;
+    const url = KICK_API_BASE + encodeURIComponent(slug);
+    try {
+      return await fetchChatroomId(url, LOOKUP_DIRECT_TIMEOUT_MS);
+    } catch (e){
+      if (e && e.notFound) throw e;
+    }
+    const cancel = new AbortController();
+    try {
+      return await Promise.any(KICK_API_PROXIES.map((mk) => fetchChatroomId(mk(url), LOOKUP_PROXY_TIMEOUT_MS, cancel.signal)));
+    } finally {
+      cancel.abort(); // гасим проигравшие запросы
+    }
   }
 
   function connectKickWebSocket(chatroomId, isRetry){
@@ -2390,11 +2521,27 @@
     clearReconnect();
     const myGen = ++connectionGen;
     setStatus('connecting', 'подключение к чату…', '');
-    ws = new WebSocket(PUSHER_URL);
+    const socket = new WebSocket(PUSHER_URL);
+    ws = socket;
 
     let subscribed = [];
-    let eventsSeen = 0;
     let chatSeen = 0;
+
+    let closedHandled = false;
+    const watchdog = startWatchdog(
+      socket, myGen,
+      () => socket.send(JSON.stringify({ event:'pusher:ping', data:{} })),
+      () => handleClose()
+    );
+    // Единая точка «соединение потеряно»: вызывается и из onclose, и из
+    // сторожа. Флаг не даёт запланировать реконнект дважды.
+    function handleClose(){
+      if (closedHandled) return;
+      closedHandled = true;
+      watchdog.stop();
+      if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную — не плодим второй цикл реконнекта
+      scheduleReconnect(() => connectKickWebSocket(chatroomId, true), myGen);
+    }
 
     function updateLiveDetail(){
       setStatus('live', 'в эфире — слушаю чат', 'сообщений: ' + chatSeen);
@@ -2410,14 +2557,22 @@
       'chatroom.' + chatroomId,
     ];
 
-    ws.onmessage = (evt) => {
+    socket.onmessage = (evt) => {
+      watchdog.touch();
       let outer;
       try { outer = JSON.parse(evt.data); } catch(e){ return; }
-      eventsSeen++;
+
+      // Протокол Pusher: сервер шлёт pusher:ping, если давно не слышал клиента —
+      // без ответа pusher:pong он закрывает «неактивное» соединение.
+      if (outer.event === 'pusher:ping'){
+        socket.send(JSON.stringify({ event:'pusher:pong', data:{} }));
+        return;
+      }
+      if (outer.event === 'pusher:pong') return;
 
       if (outer.event === 'pusher:connection_established'){
         channelCandidates.forEach((ch) => {
-          ws.send(JSON.stringify({ event:'pusher:subscribe', data:{ channel: ch } }));
+          socket.send(JSON.stringify({ event:'pusher:subscribe', data:{ channel: ch } }));
         });
         setStatus('connecting', 'подписка на канал чата…', 'сообщений: 0');
         return;
@@ -2450,11 +2605,8 @@
       }
     };
 
-    ws.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте ID чата и подключение к интернету');
-    ws.onclose = () => {
-      if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную — не плодим второй цикл реконнекта
-      scheduleReconnect(() => connectKickWebSocket(chatroomId, true), myGen);
-    };
+    socket.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте ID чата и подключение к интернету');
+    socket.onclose = handleClose;
   }
 
   // Kick присылает сообщения чата в разных форматах в зависимости от версии клиента —
@@ -2487,6 +2639,20 @@
 
     let chatSeen = 0;
     let joined = false;
+
+    let closedHandled = false;
+    const watchdog = startWatchdog(
+      socket, myGen,
+      () => socket.send('PING :tmi.twitch.tv'), // сервер отвечает PONG — это и есть признак жизни
+      () => handleClose()
+    );
+    function handleClose(){
+      if (closedHandled) return;
+      closedHandled = true;
+      watchdog.stop();
+      if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную — не плодим второй цикл реконнекта
+      scheduleReconnect(() => connectTwitchIRC(channel, true), myGen);
+    }
     const guestNick = 'justinfan' + (10000 + Math.floor(Math.random() * 89999));
 
     function updateLiveDetail(){
@@ -2502,9 +2668,17 @@
     };
 
     socket.onmessage = (evt) => {
+      watchdog.touch();
       const lines = String(evt.data).split('\r\n').filter(Boolean);
       lines.forEach((line) => {
         if (line.startsWith('PING')){ socket.send('PONG :tmi.twitch.tv'); return; }
+
+        // Twitch просит переподключиться (плановая миграция сервера) — делаем это сразу.
+        if (/^:tmi\.twitch\.tv RECONNECT/.test(line)){
+          try { socket.close(); } catch(e){}
+          handleClose();
+          return;
+        }
 
         if (!joined && (/ 366 /.test(line) || / JOIN #/.test(line))){
           joined = true;
@@ -2528,10 +2702,7 @@
     };
 
     socket.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте никнейм канала и подключение к интернету');
-    socket.onclose = () => {
-      if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную — не плодим второй цикл реконнекта
-      scheduleReconnect(() => connectTwitchIRC(channel, true), myGen);
-    };
+    socket.onclose = handleClose;
   }
 
   // Разбор строки Twitch IRC вида:
@@ -2572,7 +2743,7 @@
     // это уже было безопасно от разметки, но правильнее строить DOM-узел
     // напрямую, как и весь остальной код на странице, а не собирать HTML
     // из строк вручную.
-    const manualUrl = 'https://kick.com/api/v2/channels/' + encodeURIComponent(CHANNEL_SLUG || '');
+    const manualUrl = KICK_API_BASE + encodeURIComponent(CHANNEL_SLUG || '');
     el.manualLinkWrap.innerHTML = '';
     const a = document.createElement('a');
     a.href = manualUrl;
@@ -2826,7 +2997,6 @@
   let bgStars = [];            // декоративные белые звёзды фона
   let animState = 'idle';      // idle | gather | merged | roulette | done
   let stateStart = 0;
-  let speedMul = 1;
   let winnerKeys = [];
   let currentDrawCount = 1;
 
@@ -3073,6 +3243,31 @@
   // Инвалидируется в syncParticles() при реальном изменении состава частиц.
   let mergedColorsCache = null;
 
+  // Ореол объединённой звезды — маленький офскрин-спрайт, а не новый
+  // createRadialGradient на каждый кадр. Цвет плавно перетекает между цветами
+  // палитры, поэтому квантуем его (шаг 8) — спрайтов набирается немного, а
+  // глазом ступеньки не видны. Кэш ограничен и просто сбрасывается при переполнении.
+  const mergedHaloSprites = new Map();
+  function getMergedHaloSprite(r, g, b){
+    const q = (v) => Math.min(255, Math.round(v / 8) * 8);
+    const rgbKey = q(r) + ',' + q(g) + ',' + q(b);
+    let sprite = mergedHaloSprites.get(rgbKey);
+    if (sprite) return sprite;
+    if (mergedHaloSprites.size >= 96) mergedHaloSprites.clear();
+    const S = 64;
+    sprite = document.createElement('canvas');
+    sprite.width = sprite.height = S;
+    const brush = sprite.getContext('2d');
+    const grad = brush.createRadialGradient(S/2, S/2, 0, S/2, S/2, S/2);
+    grad.addColorStop(0,  'rgba(' + rgbKey + ',.24)');
+    grad.addColorStop(.4, 'rgba(' + rgbKey + ',.12)');
+    grad.addColorStop(1,  'rgba(' + rgbKey + ',0)');
+    brush.fillStyle = grad;
+    brush.fillRect(0, 0, S, S);
+    mergedHaloSprites.set(rgbKey, sprite);
+    return sprite;
+  }
+
   function drawMergedStar(now, opacity){
     if (opacity <= 0) return;
     // Раньше этот массив пересобирался (со спредом всей Map и Set-дедупом)
@@ -3094,13 +3289,9 @@
     const pulse=.3*Math.sin(now/380);
     // One compact coloured core (about 7 px), with a faint 24 px halo.
     ctx.save();
-    const halo=ctx.createRadialGradient(cx(),cy(),0,cx(),cy(),12+pulse);
-    halo.addColorStop(0,'rgba('+rgb.join(',')+',.24)');
-    halo.addColorStop(.4,'rgba('+rgb.join(',')+',.12)');
-    halo.addColorStop(1,'rgba('+rgb.join(',')+',0)');
+    const haloSize = 24 + pulse * 2;
     ctx.globalAlpha=opacity;
-    ctx.fillStyle=halo;
-    ctx.fillRect(cx()-13,cy()-13,26,26);
+    ctx.drawImage(getMergedHaloSprite(rgb[0],rgb[1],rgb[2]), cx()-haloSize/2, cy()-haloSize/2, haloSize, haloSize);
     ctx.restore();
     drawStar(cx(),cy(),3.4+pulse,color,.9*opacity,4);
   }
@@ -3787,6 +3978,7 @@
       const entryNameEls = el.winnersList.querySelectorAll('.winner-entry .name');
       if (entryNameEls[idx]) entryNameEls[idx].textContent = newName;
 
+      markHistoryReplaced(oldKey);
       addHistoryEntries([newKey]);
       renderEntrants();
       setActiveIndex(idx);
