@@ -1577,16 +1577,10 @@
     requestAnimationFrame(fn);
   }
 (function(){
-  const PUSHER_URL = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.4.0&flash=false';
+  // Адрес вашего Worker (после `wrangler deploy`), без /webhook на конце
+  const RELAY = 'https://kick-raffle-relay.obsbots77.workers.dev';
+  const KICK_API_BASE = 'https://kick.com/api/v2/channels/'; // только для подсказки с ручным ID
   const TWITCH_IRC_URL = 'wss://irc-ws.chat.twitch.tv:443';
-  // Kick API не отдаёт CORS-заголовки для чужих сайтов, поэтому с GitHub Pages
-  // прямой запрос часто падает — тогда пробуем публичные CORS-прокси.
-  const KICK_API_BASE = 'https://kick.com/api/v2/channels/';
-  const KICK_API_PROXIES = [
-    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
-    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
-    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
-  ];
   const LOOKUP_DIRECT_TIMEOUT_MS = 6000;
   const LOOKUP_PROXY_TIMEOUT_MS = 8000;
 
@@ -2474,138 +2468,61 @@
 
   /* ---------------- connection ---------------- */
 
-  // Один запрос с жёстким таймаутом. outerSignal позволяет отменить его
-  // снаружи, когда другой источник (прокси) уже ответил первым.
-  async function fetchChatroomId(url, timeoutMs, outerSignal){
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    const onOuterAbort = () => ctrl.abort();
-    if (outerSignal) outerSignal.addEventListener('abort', onOuterAbort);
-    try {
-      const res = await fetch(url, { headers: { 'Accept': 'application/json' }, signal: ctrl.signal });
-      if (!res.ok){
-        const err = new Error('http ' + res.status);
-        err.notFound = (res.status === 404);
-        throw err;
-      }
-      const json = await res.json();
-      const id = json && json.chatroom && json.chatroom.id;
-      if (!id) throw new Error('нет chatroom.id');
-      return id;
-    } finally {
-      clearTimeout(timer);
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
-    }
-  }
-
-  // Сначала напрямую (6 с). Если не вышло (CORS, сеть, таймаут) — все прокси
-  // параллельно, берём первый удачный ответ. Читаемый 404 от самого Kick —
-  // честный ответ «канала нет», прокси тут не нужны.
   async function lookupChatroomId(slug){
-    const url = KICK_API_BASE + encodeURIComponent(slug);
-    try {
-      return await fetchChatroomId(url, LOOKUP_DIRECT_TIMEOUT_MS);
-    } catch (e){
-      if (e && e.notFound) throw e;
+    // Имя сохранено, чтобы не править остальной код. Теперь возвращает
+    // broadcaster_user_id и заодно создаёт подписку на чат через ваш Worker.
+    const res = await fetch(RELAY + '/api/subscribe?slug=' + encodeURIComponent(slug), { method: 'POST' });
+    if (!res.ok){
+      const err = new Error('http ' + res.status);
+      err.notFound = (res.status === 404);
+      throw err;
     }
-    const cancel = new AbortController();
-    try {
-      return await Promise.any(KICK_API_PROXIES.map((mk) => fetchChatroomId(mk(url), LOOKUP_PROXY_TIMEOUT_MS, cancel.signal)));
-    } finally {
-      cancel.abort(); // гасим проигравшие запросы
-    }
+    const j = await res.json();
+    if (!j.broadcaster_user_id) throw new Error('нет broadcaster_user_id');
+    return j.broadcaster_user_id;
   }
 
-  function connectKickWebSocket(chatroomId, isRetry){
+  function connectKickWebSocket(broadcasterId, isRetry){
     if (!isRetry) reconnectAttempts = 0;
     clearReconnect();
     const myGen = ++connectionGen;
     setStatus('connecting', 'подключение к чату…', '');
-    const socket = new WebSocket(PUSHER_URL);
+    const socket = new WebSocket(RELAY.replace(/^http/, 'ws') + '/ws?channel=' + encodeURIComponent(broadcasterId));
     ws = socket;
 
-    let subscribed = [];
     let chatSeen = 0;
-
     let closedHandled = false;
     const watchdog = startWatchdog(
       socket, myGen,
-      () => socket.send(JSON.stringify({ event:'pusher:ping', data:{} })),
+      () => socket.send('ping'),   // Worker отвечает 'pong' автоматически
       () => handleClose()
     );
-    // Единая точка «соединение потеряно»: вызывается и из onclose, и из
-    // сторожа. Флаг не даёт запланировать реконнект дважды.
     function handleClose(){
       if (closedHandled) return;
       closedHandled = true;
       watchdog.stop();
-      if (myGen !== connectionGen) return; // соединение уже переоткрыли вручную — не плодим второй цикл реконнекта
-      scheduleReconnect(() => connectKickWebSocket(chatroomId, true), myGen);
+      if (myGen !== connectionGen) return;
+      scheduleReconnect(() => connectKickWebSocket(broadcasterId, true), myGen);
     }
 
-    function updateLiveDetail(){
-      setStatus('live', 'в эфире — слушаю чат', 'сообщений: ' + chatSeen);
-    }
-
-    // Kick меняла формат имени Pusher-канала между версиями клиента,
-    // поэтому подписываемся сразу на все известные варианты —
-    // лишние подписки Pusher просто проигнорирует.
-    const channelCandidates = [
-      'chatrooms.' + chatroomId + '.v2',
-      'chatroom.' + chatroomId + '.v2',
-      'chatrooms.' + chatroomId,
-      'chatroom.' + chatroomId,
-    ];
-
+    socket.onopen = () => {
+      reconnectAttempts = 0;
+      setStatus('live', 'в эфире — слушаю чат', 'сообщений: 0');
+    };
     socket.onmessage = (evt) => {
       watchdog.touch();
-      let outer;
-      try { outer = JSON.parse(evt.data); } catch(e){ return; }
-
-      // Протокол Pusher: сервер шлёт pusher:ping, если давно не слышал клиента —
-      // без ответа pusher:pong он закрывает «неактивное» соединение.
-      if (outer.event === 'pusher:ping'){
-        socket.send(JSON.stringify({ event:'pusher:pong', data:{} }));
-        return;
-      }
-      if (outer.event === 'pusher:pong') return;
-
-      if (outer.event === 'pusher:connection_established'){
-        channelCandidates.forEach((ch) => {
-          socket.send(JSON.stringify({ event:'pusher:subscribe', data:{ channel: ch } }));
-        });
-        setStatus('connecting', 'подписка на канал чата…', 'сообщений: 0');
-        return;
-      }
-
-      if (outer.event === 'pusher_internal:subscription_succeeded'){
-        if (outer.channel) subscribed.push(outer.channel);
-        reconnectAttempts = 0; // соединение стабильно установлено — сбрасываем счётчик backoff
-        updateLiveDetail();
-        return;
-      }
-
-      if (outer.event === 'pusher:error' || outer.event === 'pusher_internal:subscription_error'){
-        console.warn('Kick/Pusher error event:', outer);
-        setStatus('err', 'pusher вернул ошибку подписки', JSON.stringify(outer.data || outer));
-        return;
-      }
-
-      // событие чат-сообщения — имя менялось у Kick, ловим оба варианта
-      if (/App\\Events\\ChatMessage(Sent)?Event$/.test(outer.event)){
-        let data;
-        try { data = JSON.parse(outer.data); } catch(e){ console.warn('не удалось разобрать data', outer); return; }
-        const parsed = extractChatMessage(data);
-        if (parsed){
-          chatSeen++;
-          if (subscribed.length) updateLiveDetail();
-          handleChatMessage(parsed);
-        }
-        return;
+      if (evt.data === 'pong') return;
+      let m;
+      try { m = JSON.parse(evt.data); } catch(e){ return; }
+      if (m.type !== 'chat') return;
+      const parsed = extractChatMessage(m.data);
+      if (parsed){
+        chatSeen++;
+        setStatus('live', 'в эфире — слушаю чат', 'сообщений: ' + chatSeen);
+        handleChatMessage(parsed);
       }
     };
-
-    socket.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте ID чата и подключение к интернету');
+    socket.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте адрес Worker и подключение к интернету');
     socket.onclose = handleClose;
   }
 
