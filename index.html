@@ -1431,7 +1431,7 @@
 <div class="wrap">
 
   <div class="topbar">
-    <div class="brand"><span class="mark" id="brandMark">KICK</span> розыгрыш по слову в чате by <span class="author">coffee_mayzz</span></div>
+    <div class="brand"><span class="mark" id="brandMark">KICK</span> розыгрыш по слову в чате by <span class="author">coffee_mayzz</span> & <span class="author"> ugewaru</span></div>
 
     <div class="status-pill" role="status" aria-live="polite" aria-atomic="true"><span class="dot" id="statusDot"></span><span id="statusText">не подключено</span></div>
   </div>
@@ -1577,10 +1577,16 @@
     requestAnimationFrame(fn);
   }
 (function(){
-  // Адрес вашего Worker (после `wrangler deploy`), без /webhook на конце
-  const RELAY = 'https://kick-raffle-relay.obsbots77.workers.dev';
-  const KICK_API_BASE = 'https://kick.com/api/v2/channels/'; // только для подсказки с ручным ID
+  const PUSHER_URL = 'wss://ws-us2.pusher.com/app/34bf7a0ff419a2a775b9?protocol=7&client=js&version=7.4.0&flash=false';
   const TWITCH_IRC_URL = 'wss://irc-ws.chat.twitch.tv:443';
+  // Kick API не отдаёт CORS-заголовки для чужих сайтов, поэтому с GitHub Pages
+  // прямой запрос часто падает — тогда пробуем публичные CORS-прокси.
+  const KICK_API_BASE = 'https://kick.com/api/v2/channels/';
+  const KICK_API_PROXIES = [
+    (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+    (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+    (u) => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
+  ];
   const LOOKUP_DIRECT_TIMEOUT_MS = 6000;
   const LOOKUP_PROXY_TIMEOUT_MS = 8000;
 
@@ -1787,6 +1793,8 @@
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   let connectionGen = 0;
+  let releaseConnection = null;
+  let probeConnection = null;
   // Первые FAST_RECONNECT_ATTEMPTS попыток идут с растущей паузой (до 20 с),
   // дальше — редкие, но бесконечные повторы раз в SLOW_RECONNECT_SEC. В OBS
   // browser source перезагрузка страницы — ручное действие стримера, поэтому
@@ -1800,15 +1808,15 @@
     pendingReconnect = null;
   }
 
-  function scheduleReconnect(fn, myGen){
+  function scheduleReconnect(fn, myGen, reason = '', immediate = false){
     clearReconnect();
     reconnectAttempts++;
     const slow = reconnectAttempts > FAST_RECONNECT_ATTEMPTS;
-    const delaySec = slow ? SLOW_RECONNECT_SEC : Math.min(20, Math.round(Math.pow(1.7, reconnectAttempts)));
+    const delaySec = immediate ? 0 : (slow ? SLOW_RECONNECT_SEC : Math.min(20, Math.round(Math.pow(1.7, reconnectAttempts))));
     if (slow){
-      setStatus('err', 'нет связи с чатом, повтор через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' — проверьте интернет и ник/ID канала');
+      setStatus('err', 'нет связи с чатом, повтор через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + (reason ? ' — ' + reason : ' — проверьте интернет и ник/ID канала'));
     } else {
-      setStatus('connecting', 'связь оборвалась, переподключение через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' из ' + FAST_RECONNECT_ATTEMPTS);
+      setStatus('connecting', 'связь оборвалась, переподключение через ' + delaySec + ' с…', 'попытка ' + reconnectAttempts + ' из ' + FAST_RECONNECT_ATTEMPTS + (reason ? ' — ' + reason : ''));
     }
     const run = () => {
       reconnectTimer = null;
@@ -1820,12 +1828,21 @@
     reconnectTimer = setTimeout(run, delaySec * 1000);
   }
 
-  // Вернулась сеть — не ждём окончания паузы (особенно длинной, 90 с).
-  window.addEventListener('online', () => {
-    if (!pendingReconnect) return;
-    const run = pendingReconnect;
-    clearTimeout(reconnectTimer);
-    run();
+  // Сеть или вкладка вернулись: повторяем подключение либо проверяем
+  // ещё открытый сокет. Событие online само по себе не доказывает связь с Kick.
+  function resumeChatConnection(){
+    if (pendingReconnect){
+      const run = pendingReconnect;
+      clearTimeout(reconnectTimer);
+      run();
+    } else if (probeConnection){
+      probeConnection();
+    }
+  }
+  window.addEventListener('online', resumeChatConnection);
+  window.addEventListener('pageshow', resumeChatConnection);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resumeChatConnection();
   });
 
   /* ---------------- сторожевой таймер сокета ----------------
@@ -2468,62 +2485,250 @@
 
   /* ---------------- connection ---------------- */
 
-  async function lookupChatroomId(slug){
-    // Имя сохранено, чтобы не править остальной код. Теперь возвращает
-    // broadcaster_user_id и заодно создаёт подписку на чат через ваш Worker.
-    const res = await fetch(RELAY + '/api/subscribe?slug=' + encodeURIComponent(slug), { method: 'POST' });
-    if (!res.ok){
-      const err = new Error('http ' + res.status);
-      err.notFound = (res.status === 404);
-      throw err;
+  // Один запрос с жёстким таймаутом. outerSignal позволяет отменить его
+  // снаружи, когда другой источник (прокси) уже ответил первым.
+  async function fetchChatroomId(url, timeoutMs, outerSignal){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    const onOuterAbort = () => ctrl.abort();
+    if (outerSignal) outerSignal.addEventListener('abort', onOuterAbort);
+    try {
+      const res = await fetch(url, { headers: { 'Accept': 'application/json' }, signal: ctrl.signal });
+      if (!res.ok){
+        const err = new Error('http ' + res.status);
+        err.notFound = (res.status === 404);
+        throw err;
+      }
+      const json = await res.json();
+      const id = json && json.chatroom && json.chatroom.id;
+      if (!id) throw new Error('нет chatroom.id');
+      return id;
+    } finally {
+      clearTimeout(timer);
+      if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
     }
-    const j = await res.json();
-    if (!j.broadcaster_user_id) throw new Error('нет broadcaster_user_id');
-    return j.broadcaster_user_id;
   }
 
-  function connectKickWebSocket(broadcasterId, isRetry){
+  // Сначала напрямую (6 с). Если не вышло (CORS, сеть, таймаут) — все прокси
+  // параллельно, берём первый удачный ответ. Читаемый 404 от самого Kick —
+  // честный ответ «канала нет», прокси тут не нужны.
+  async function lookupChatroomId(slug){
+    const url = KICK_API_BASE + encodeURIComponent(slug);
+    try {
+      return await fetchChatroomId(url, LOOKUP_DIRECT_TIMEOUT_MS);
+    } catch (e){
+      if (e && e.notFound) throw e;
+    }
+    const cancel = new AbortController();
+    try {
+      return await Promise.any(KICK_API_PROXIES.map((mk) => fetchChatroomId(mk(url), LOOKUP_PROXY_TIMEOUT_MS, cancel.signal)));
+    } finally {
+      cancel.abort(); // гасим проигравшие запросы
+    }
+  }
+
+  function connectKickWebSocket(chatroomId, isRetry){
     if (!isRetry) reconnectAttempts = 0;
-    clearReconnect();
-    const myGen = ++connectionGen;
+    disconnect();
+    const myGen = connectionGen;
     setStatus('connecting', 'подключение к чату…', '');
-    const socket = new WebSocket(RELAY.replace(/^http/, 'ws') + '/ws?channel=' + encodeURIComponent(broadcasterId));
+
+    let socket;
+    try {
+      socket = new WebSocket(PUSHER_URL);
+    } catch(e){
+      scheduleReconnect(() => connectKickWebSocket(chatroomId, true), myGen, 'не удалось открыть соединение');
+      return;
+    }
     ws = socket;
 
+    const primaryChannel = 'chatrooms.' + chatroomId + '.v2';
+    const channelCandidates = [
+      primaryChannel, 'chatroom.' + chatroomId + '.v2',
+      'chatrooms.' + chatroomId, 'chatroom.' + chatroomId,
+    ];
+    const CONNECT_TIMEOUT_MS = 20000;
+    const SUBSCRIBE_TIMEOUT_MS = 15000;
+    const PONG_TIMEOUT_MS = 30000;
+    let activityTimeoutMs = 25000;
+    let closed = false;
+    let established = false;
+    let subscribed = false;
     let chatSeen = 0;
-    let closedHandled = false;
-    const watchdog = startWatchdog(
-      socket, myGen,
-      () => socket.send('ping'),   // Worker отвечает 'pong' автоматически
-      () => handleClose()
-    );
-    function handleClose(){
-      if (closedHandled) return;
-      closedHandled = true;
-      watchdog.stop();
-      if (myGen !== connectionGen) return;
-      scheduleReconnect(() => connectKickWebSocket(broadcasterId, true), myGen);
+    let heartbeatTimer = null;
+    let pongTimer = null;
+    let probeSentAt = null;
+    let phaseTimer = null;
+    let stableTimer = null;
+
+    function isCurrent(){
+      return !closed && myGen === connectionGen && ws === socket;
+    }
+    function dispose(){
+      closed = true;
+      clearTimeout(phaseTimer);
+      clearTimeout(heartbeatTimer);
+      clearTimeout(pongTimer);
+      clearTimeout(stableTimer);
+      socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+      if (ws === socket) ws = null;
+      if (releaseConnection === dispose) releaseConnection = null;
+      if (probeConnection === resumeProbe) probeConnection = null;
+      try { socket.close(); } catch(e){}
+    }
+    function fail(reason, code = 0){
+      if (!isCurrent()) return;
+      console.warn('Kick: соединение прервано', { reason, code });
+      dispose();
+      // Такие коды означают неверный ключ/протокол или запрещённый доступ:
+      // бесконечный повтор того же запроса не восстановит соединение.
+      if (code >= 4000 && code < 4100 && code !== 4004){
+        setStatus('err', 'сервер отклонил подключение к чату', reason + ' — код ' + code);
+        return;
+      }
+      if (code === 4004) reconnectAttempts = Math.max(reconnectAttempts, FAST_RECONNECT_ATTEMPTS);
+      scheduleReconnect(() => connectKickWebSocket(chatroomId, true), myGen,
+        reason, code >= 4200 && code < 4300);
+    }
+    function send(event, data = {}){
+      if (!isCurrent()) return false;
+      if (socket.readyState !== WebSocket.OPEN){
+        fail('соединение закрыто');
+        return false;
+      }
+      try {
+        socket.send(JSON.stringify({ event, data }));
+        return true;
+      } catch(e){
+        fail('не удалось отправить проверку связи');
+        return false;
+      }
+    }
+    function updateLiveDetail(){
+      setStatus('live', 'в эфире — слушаю чат', 'сообщений: ' + chatSeen);
+    }
+    // Любой ответ подтверждает жизнь транспорта. Подписка при этом имеет
+    // собственный срок ожидания: одни pong не означают, что чат подключён.
+    function touch(){
+      clearTimeout(heartbeatTimer);
+      clearTimeout(pongTimer);
+      pongTimer = null;
+      probeSentAt = null;
+      if (established){
+        heartbeatTimer = setTimeout(sendProbe, activityTimeoutMs);
+      }
+    }
+    function sendProbe(){
+      if (!isCurrent() || !established || pongTimer !== null) return;
+      clearTimeout(heartbeatTimer);
+      probeSentAt = Date.now();
+      pongTimer = setTimeout(() => fail('сервер не ответил на проверку связи'), PONG_TIMEOUT_MS);
+      send('pusher:ping');
+    }
+    function resumeProbe(){
+      if (!isCurrent()) return;
+      if (socket.readyState > WebSocket.OPEN){
+        fail('соединение закрыто во время ожидания');
+        return;
+      }
+      if (!established) return;
+      // После сна старый таймер мог просрочиться. Даём НОВОМУ ping время
+      // получить ответ, вместо закрытия здорового сокета за время сна.
+      if (pongTimer !== null && Date.now() - probeSentAt < PONG_TIMEOUT_MS) return;
+      clearTimeout(pongTimer);
+      pongTimer = null;
+      sendProbe();
+    }
+    function markSubscribed(){
+      if (subscribed) return;
+      subscribed = true;
+      clearTimeout(phaseTimer);
+      // Не сбрасываем backoff на коротких подключениях, которые тут же падают.
+      stableTimer = setTimeout(() => {
+        if (isCurrent()) reconnectAttempts = 0;
+      }, 10000);
+      updateLiveDetail();
+    }
+    function parseData(data){
+      return typeof data === 'string' ? JSON.parse(data) : data;
     }
 
-    socket.onopen = () => {
-      reconnectAttempts = 0;
-      setStatus('live', 'в эфире — слушаю чат', 'сообщений: 0');
-    };
+    releaseConnection = dispose;
+    probeConnection = resumeProbe;
+    phaseTimer = setTimeout(() => fail('сервер не подтвердил подключение'), CONNECT_TIMEOUT_MS);
+
     socket.onmessage = (evt) => {
-      watchdog.touch();
-      if (evt.data === 'pong') return;
-      let m;
-      try { m = JSON.parse(evt.data); } catch(e){ return; }
-      if (m.type !== 'chat') return;
-      const parsed = extractChatMessage(m.data);
-      if (parsed){
-        chatSeen++;
-        setStatus('live', 'в эфире — слушаю чат', 'сообщений: ' + chatSeen);
-        handleChatMessage(parsed);
+      if (!isCurrent()) return;
+      let outer;
+      try { outer = JSON.parse(evt.data); } catch(e){ return; }
+      if (!outer || typeof outer.event !== 'string') return;
+      touch();
+
+      if (outer.event === 'pusher:ping'){
+        send('pusher:pong');
+        return;
+      }
+      if (outer.event === 'pusher:pong') return;
+
+      if (outer.event === 'pusher:connection_established'){
+        if (established) return;
+        let data;
+        try { data = parseData(outer.data); } catch(e){
+          fail('не удалось прочитать подтверждение подключения');
+          return;
+        }
+        const serverTimeout = Number(data && data.activity_timeout);
+        if (Number.isFinite(serverTimeout) && serverTimeout > 0){
+          activityTimeoutMs = Math.min(activityTimeoutMs, serverTimeout * 1000);
+        }
+        established = true;
+        touch();
+        clearTimeout(phaseTimer);
+        phaseTimer = setTimeout(() => fail('сервер не подтвердил подписку на чат'), SUBSCRIBE_TIMEOUT_MS);
+        setStatus('connecting', 'подписка на канал чата…', 'сообщений: 0');
+        for (const channel of channelCandidates){
+          if (!send('pusher:subscribe', { channel })) return;
+        }
+        return;
+      }
+
+      if (outer.event === 'pusher_internal:subscription_succeeded'){
+        // Подтверждение случайного публичного канала не подтверждает чат Kick.
+        if (established && outer.channel === primaryChannel) markSubscribed();
+        return;
+      }
+
+      if (outer.event === 'pusher:error' || outer.event === 'pusher_internal:subscription_error'){
+        let data;
+        try { data = parseData(outer.data); } catch(e){ data = null; }
+        const failedChannel = outer.channel || (data && data.channel);
+        if (failedChannel && channelCandidates.includes(failedChannel) && failedChannel !== primaryChannel){
+          console.warn('Kick: дополнительная подписка недоступна', failedChannel);
+          return;
+        }
+        fail('ошибка подключения к чату' + (data && data.message ? ': ' + data.message : ''), Number(data && data.code) || 0);
+        return;
+      }
+
+      if (/App\\Events\\ChatMessage(Sent)?Event$/.test(outer.event)){
+        if (!established || !channelCandidates.includes(outer.channel)) return;
+        let data;
+        try { data = parseData(outer.data); } catch(e){ return; }
+        const parsed = extractChatMessage(data);
+        if (parsed){
+          // Реальное сообщение также подтверждает подписку, в том числе
+          // когда сервер использует старое имя канала.
+          markSubscribed();
+          chatSeen++;
+          updateLiveDetail();
+          handleChatMessage(parsed);
+        }
       }
     };
-    socket.onerror = () => setStatus('err', 'ошибка соединения', 'проверьте адрес Worker и подключение к интернету');
-    socket.onclose = handleClose;
+    socket.onerror = () => fail('ошибка соединения с сервером');
+    socket.onclose = (evt) => fail(
+      'соединение закрыто' + (evt.code ? ' (код ' + evt.code + ')' : '') +
+      (evt.reason ? ': ' + evt.reason : ''), evt.code);
   }
 
   // Kick присылает сообщения чата в разных форматах в зависимости от версии клиента —
@@ -2548,8 +2753,8 @@
   // отправлять сообщения так нельзя, но для розыгрыша нужно только читать).
   function connectTwitchIRC(channel, isRetry){
     if (!isRetry) reconnectAttempts = 0;
-    clearReconnect();
-    const myGen = ++connectionGen;
+    disconnect();
+    const myGen = connectionGen;
     setStatus('connecting', 'подключение к чату…', '');
     const socket = new WebSocket(TWITCH_IRC_URL);
     ws = socket;
@@ -2652,7 +2857,13 @@
   function disconnect(){
     clearReconnect();
     connectionGen++; // делает соединение, которое сейчас закрываем, "устаревшим" — его onclose больше не будет пытаться переподключиться сам
-    if (ws){ try { ws.close(); } catch(e){} ws = null; }
+    if (releaseConnection) releaseConnection();
+    probeConnection = null;
+    if (ws){
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      try { ws.close(); } catch(e){}
+      ws = null;
+    }
   }
 
   function updateManualUrl(){
@@ -2673,6 +2884,7 @@
 
   async function connectToChannel(){
     disconnect();
+    const lookupGen = connectionGen;
 
     if (PLATFORM === 'twitch'){
       if (!CHANNEL_SLUG){ setStatus('err', 'канал не выбран', 'введите никнейм на стартовом экране'); return; }
@@ -2686,9 +2898,11 @@
     setStatus('connecting', 'ищу канал ' + CHANNEL_SLUG + '…', '');
     try {
       const id = await lookupChatroomId(CHANNEL_SLUG);
+      if (lookupGen !== connectionGen) return;
       el.fallbackBox.classList.remove('show');
       connectKickWebSocket(id);
     } catch (e){
+      if (lookupGen !== connectionGen) return;
       el.fallbackBox.classList.add('show');
       setStatus('err', 'не удалось найти канал автоматически', 'см. подсказку ниже, чтобы ввести ID чата вручную');
     }
@@ -2835,6 +3049,7 @@
     }
 
     async function trySplashConnect(){
+      if (btn.disabled) return;
       clearError();
       const slug = extractSlug(input.value);
       if (!slug){ showError('Введите никнейм канала'); input.focus(); return; }
